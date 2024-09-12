@@ -717,6 +717,7 @@ where
             deno_fetch::deno_fetch::init_ops::<Permissions>(deno_fetch::Options {
                 user_agent: SUPABASE_UA.clone(),
                 root_cert_store_provider: Some(root_cert_store_provider.clone()),
+                unsafely_ignore_certificate_errors: Some(vec![]),
                 ..Default::default()
             }),
             deno_websocket::deno_websocket::init_ops::<Permissions>(
