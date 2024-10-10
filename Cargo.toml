@@ -148,4 +148,5 @@ inherits = "dev"
 debug-assertions = false
 
 [profile.release]
-lto = true
+debug = true
+lto = "thin"

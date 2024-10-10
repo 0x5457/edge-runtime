@@ -1,17 +1,19 @@
 #[path = "../src/utils/integration_test_helper.rs"]
 mod integration_test_helper;
 
+use deno_config::JsxImportSourceConfig;
 use http_v02 as http;
 use hyper_v014 as hyper;
 use reqwest_v011 as reqwest;
-use sb_graph::EszipPayloadKind;
+use sb_graph::{emitter::EmitterFactory, generate_binary_eszip, EszipPayloadKind};
+use url::Url;
 
 use std::{
     borrow::Cow,
     collections::HashMap,
     io::{self, Cursor},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -906,9 +908,7 @@ async fn test_worker_boot_with_0_byte_eszip() {
     let result = create_test_user_worker(opts).await;
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
+    assert!(format!("{:#}", result.unwrap_err())
         .starts_with("worker boot error: unexpected end of file"));
 }
 
@@ -934,10 +934,9 @@ async fn test_worker_boot_with_invalid_entrypoint() {
     let result = create_test_user_worker(opts).await;
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .starts_with("worker boot error: failed to read path"));
+    assert!(
+        format!("{:#}", result.unwrap_err()).starts_with("worker boot error: failed to read path")
+    );
 }
 
 #[tokio::test]
@@ -1550,11 +1549,6 @@ async fn test_decorators(ty: Option<DecoratorType>) {
         }),
         TerminationToken::new()
     );
-}
-
-#[derive(Deserialize)]
-struct ErrorResponsePayload {
-    msg: String,
 }
 
 #[tokio::test]
@@ -2323,6 +2317,242 @@ async fn test_declarative_style_fetch_handler() {
         }),
         TerminationToken::new()
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_issue_420() {
+    integration_test!(
+        "./test_cases/main",
+        NON_SECURE_PORT,
+        "issue-420",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let text = resp.unwrap().text().await.unwrap();
+
+            assert!(text.starts_with("file:///"));
+            assert!(text.ends_with(
+                "/node_modules/localhost/@imagemagick/magick-wasm/0.0.30/dist/index.js"
+            ));
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_should_render_detailed_failed_to_create_graph_error() {
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "graph-error-1",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let (payload, status) = ErrorResponsePayload::assert_error_response(resp).await;
+
+                assert_eq!(status, 500);
+                assert!(payload.msg.starts_with(
+                    "InvalidWorkerCreation: worker boot error: failed to create the graph: \
+                    Relative import path \"oak\" not prefixed with"
+                ));
+            }),
+            TerminationToken::new()
+        );
+    }
+
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "graph-error-2",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let (payload, status) = ErrorResponsePayload::assert_error_response(resp).await;
+
+                assert_eq!(status, 500);
+                assert!(payload.msg.starts_with(
+                    "InvalidWorkerCreation: worker boot error: failed to create the graph: \
+                    Module not found \"file://"
+                ));
+            }),
+            TerminationToken::new()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_js_entrypoint() {
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "serve-js",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let resp = resp.unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                let msg = resp.text().await.unwrap();
+                assert_eq!(msg, "meow");
+            }),
+            TerminationToken::new()
+        );
+    }
+
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "serve-declarative-style-js",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let resp = resp.unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                let msg = resp.text().await.unwrap();
+                assert_eq!(msg, "meow");
+            }),
+            TerminationToken::new()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_should_be_able_to_bundle_against_various_exts() {
+    let get_eszip_buf = |path: &str| {
+        let path = path.to_string();
+        let mut emitter_factory = EmitterFactory::new();
+
+        emitter_factory.set_jsx_import_source(JsxImportSourceConfig {
+            default_specifier: Some("https://esm.sh/preact".to_string()),
+            default_types_specifier: None,
+            module: "jsx-runtime".to_string(),
+            base_url: Url::from_file_path(std::env::current_dir().unwrap()).unwrap(),
+        });
+
+        async {
+            generate_binary_eszip(
+                PathBuf::from(path),
+                #[allow(clippy::arc_with_non_send_sync)]
+                Arc::new(emitter_factory),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .into_bytes()
+        }
+    };
+
+    {
+        let buf = get_eszip_buf("./test_cases/eszip-various-ext/npm-supabase/index.js").await;
+
+        let client = Client::new();
+        let req = client
+            .request(
+                Method::POST,
+                format!("http://localhost:{}/meow", NON_SECURE_PORT),
+            )
+            .body(buf);
+
+        integration_test!(
+            "./test_cases/main_eszip",
+            NON_SECURE_PORT,
+            "",
+            None,
+            None,
+            Some(req),
+            None,
+            (|resp| async {
+                let resp = resp.unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                let msg = resp.text().await.unwrap();
+                assert_eq!(msg, "function");
+            }),
+            TerminationToken::new()
+        );
+    }
+
+    let test_serve_simple_fn = |ext: &'static str, expected: &'static [u8]| {
+        let ext = ext.to_string();
+        let expected = expected.to_vec();
+
+        async move {
+            let buf = get_eszip_buf(&format!(
+                "./test_cases/eszip-various-ext/serve/index.{}",
+                ext
+            ))
+            .await;
+
+            let client = Client::new();
+            let req = client
+                .request(
+                    Method::POST,
+                    format!("http://localhost:{}/meow", NON_SECURE_PORT),
+                )
+                .body(buf);
+
+            integration_test!(
+                "./test_cases/main_eszip",
+                NON_SECURE_PORT,
+                "",
+                None,
+                None,
+                Some(req),
+                None,
+                (|resp| async move {
+                    let resp = resp.unwrap();
+                    assert_eq!(resp.status().as_u16(), 200);
+                    let msg = resp.bytes().await.unwrap();
+                    assert_eq!(msg, expected);
+                }),
+                TerminationToken::new()
+            );
+        }
+    };
+
+    test_serve_simple_fn("ts", b"meow").await;
+    test_serve_simple_fn("js", b"meow").await;
+    test_serve_simple_fn("mjs", b"meow").await;
+
+    static REACT_RESULT: &str = r#"{"type":"div","props":{"children":"meow"},"__k":null,"__":null,"__b":0,"__e":null,"__c":null,"__v":-1,"__i":-1,"__u":0}"#;
+
+    test_serve_simple_fn("jsx", REACT_RESULT.as_bytes()).await;
+    test_serve_simple_fn("tsx", REACT_RESULT.as_bytes()).await;
+}
+
+#[derive(Deserialize)]
+struct ErrorResponsePayload {
+    msg: String,
+}
+
+impl ErrorResponsePayload {
+    async fn assert_error_response(resp: Result<Response, reqwest::Error>) -> (Self, u16) {
+        let res = resp.unwrap();
+        let status = res.status().as_u16();
+        let res = res.json::<Self>().await;
+
+        assert!(res.is_ok());
+
+        (res.unwrap(), status)
+    }
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}

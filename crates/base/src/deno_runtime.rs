@@ -12,8 +12,8 @@ use deno_core::error::AnyError;
 use deno_core::url::Url;
 use deno_core::v8::{GCCallbackFlags, GCType, HeapStatistics, Isolate};
 use deno_core::{
-    located_script_name, serde_json, JsRuntime, ModuleCodeString, ModuleId, PollEventLoopOptions,
-    RuntimeOptions,
+    located_script_name, serde_json, JsRuntime, ModuleCodeString, ModuleId, ModuleLoader,
+    ModuleSpecifier, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
 };
 use deno_http::DefaultHttpPropertyExtractor;
 use deno_tls::deno_native_certs::load_native_certs;
@@ -40,9 +40,9 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 use std::thread::ThreadId;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::interval;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, PollSemaphore};
 use tracing::debug;
 
 use crate::snapshot;
@@ -93,6 +93,15 @@ pub static SHOULD_DISABLE_DEPRECATED_API_WARNING: OnceCell<bool> = OnceCell::new
 pub static SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING: OnceCell<bool> = OnceCell::new();
 pub static SHOULD_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK: OnceCell<bool> = OnceCell::new();
 pub static MAYBE_DENO_VERSION: OnceCell<String> = OnceCell::new();
+
+thread_local! {
+    // NOTE: Suppose we have met `.await` points while initializing a
+    // DenoRuntime. In that case, the current v8 isolate's thread-local state can be
+    // corrupted by a task initializing another DenoRuntime, so we must prevent this
+    // with a Semaphore.
+
+    static RUNTIME_CREATION_SEM: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+}
 
 #[ctor]
 fn init_v8_platform() {
@@ -220,6 +229,16 @@ impl<RuntimeContext> Drop for DenoRuntime<RuntimeContext> {
     }
 }
 
+impl DenoRuntime<()> {
+    pub async fn acquire() -> OwnedSemaphorePermit {
+        RUNTIME_CREATION_SEM
+            .with(|v| v.clone())
+            .acquire_owned()
+            .await
+            .unwrap()
+    }
+}
+
 impl<RuntimeContext> DenoRuntime<RuntimeContext>
 where
     RuntimeContext: GetRuntimeContext,
@@ -251,21 +270,25 @@ where
         let drop_token = CancellationToken::default();
 
         let base_dir_path = std::env::current_dir().map(|p| p.join(&service_path))?;
-        let base_url = Url::from_directory_path(&base_dir_path).unwrap();
+        let Ok(mut main_module_url) = Url::from_directory_path(&base_dir_path) else {
+            bail!(
+                "malformed base directory: {}",
+                base_dir_path.to_string_lossy()
+            );
+        };
 
-        let is_user_worker = conf.is_user_worker();
+        static POTENTIAL_EXTS: &[&str] = &["ts", "tsx", "js", "mjs", "jsx"];
 
-        let potential_exts = vec!["ts", "tsx", "js", "jsx"];
-        let mut main_module_url = base_url.join("index.ts")?;
-
-        for potential_ext in potential_exts {
-            main_module_url = base_url.join(format!("index.{}", potential_ext).as_str())?;
+        for ext in POTENTIAL_EXTS.iter() {
+            main_module_url = main_module_url.join(format!("index.{}", ext).as_str())?;
             if main_module_url.to_file_path().unwrap().exists() {
                 break;
             }
         }
 
+        let is_user_worker = conf.is_user_worker();
         let is_some_entry_point = maybe_entrypoint.is_some();
+
         if is_some_entry_point {
             main_module_url = Url::parse(&maybe_entrypoint.unwrap())?;
         }
@@ -273,6 +296,7 @@ where
         let mut net_access_disabled = false;
         let mut allow_net = None;
         let mut allow_remote_modules = true;
+
         if is_user_worker {
             let user_conf = conf.as_user_worker().unwrap();
 
@@ -310,9 +334,7 @@ where
             emitter_factory.set_decorator_type(maybe_decorator);
 
             if let Some(jsx_import_source_config) = maybe_jsx_import_source_config.clone() {
-                emitter_factory
-                    .set_jsx_import_source(jsx_import_source_config)
-                    .await;
+                emitter_factory.set_jsx_import_source(jsx_import_source_config);
             }
 
             emitter_factory.set_import_map(load_import_map(import_map_path.clone())?);
@@ -511,6 +533,7 @@ where
             compiled_wasm_module_store: None,
             startup_snapshot: snapshot::snapshot(),
             module_loader: Some(module_loader),
+            import_meta_resolve_callback: Some(Box::new(import_meta_resolve_callback)),
             ..Default::default()
         };
 
@@ -816,8 +839,19 @@ where
         let termination_request_token = self.termination_request_token.clone();
 
         let mem_check_state = is_user_worker.then(|| self.mem_check.clone());
+        let mut poll_sem = None::<PollSemaphore>;
 
         poll_fn(move |cx| {
+            if poll_sem.is_none() {
+                poll_sem = Some(RUNTIME_CREATION_SEM.with(|v| PollSemaphore::new(v.clone())));
+            }
+
+            let Poll::Ready(Some(_permit)) = poll_sem.as_mut().unwrap().poll_acquire(cx) else {
+                return Poll::Pending;
+            };
+
+            poll_sem = None;
+
             // INVARIANT: Only can steal current task by other threads when LIFO
             // task scheduler heuristic disabled. Turning off the heuristic is
             // unstable now, so it's not considered.
@@ -970,6 +1004,14 @@ where
 
         guard
     }
+}
+
+pub fn import_meta_resolve_callback(
+    loader: &dyn ModuleLoader,
+    specifier: String,
+    referrer: String,
+) -> Result<ModuleSpecifier, AnyError> {
+    loader.resolve(&specifier, &referrer, ResolutionKind::DynamicImport)
 }
 
 fn get_current_cpu_time_ns() -> Result<i64, Error> {

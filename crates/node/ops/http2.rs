@@ -238,7 +238,8 @@ pub async fn op_http2_send_response(
     }
     for (name, value) in headers {
         response.headers_mut().append(
-            HeaderName::from_lowercase(&name).unwrap(),
+            // PATCH(denoland/deno#24780): Mitigates denoland/deno#24678
+            HeaderName::from_bytes(&name).unwrap(),
             HeaderValue::from_bytes(&value).unwrap(),
         );
     }
@@ -308,7 +309,8 @@ pub async fn op_http2_client_request(
 
     for (name, value) in headers {
         req.headers_mut().unwrap().append(
-            HeaderName::from_lowercase(&name).unwrap(),
+            // PATCH(denoland/deno#24780): Mitigates denoland/deno#24678
+            HeaderName::from_bytes(&name).unwrap(),
             HeaderValue::from_bytes(&value).unwrap(),
         );
     }
