@@ -21,7 +21,7 @@ import * as response from 'ext:deno_fetch/23_response.js';
 import * as request from 'ext:deno_fetch/23_request.js';
 import * as globalInterfaces from 'ext:deno_web/04_global_interfaces.js';
 import { SUPABASE_ENV } from 'ext:sb_env/env.js';
-import ai from 'ext:sb_ai/js/ai.js';
+import { USER_WORKER_API as ai } from 'ext:sb_ai/js/ai.js';
 import { registerErrors } from 'ext:sb_core_main_js/js/errors.js';
 import {
 	formatException,
@@ -247,6 +247,7 @@ const globalScope = {
 	performance: writable(performance.performance),
 
 	// messagePort
+	MessageChannel: nonEnumerable(messagePort.MessageChannel),
 	structuredClone: writable(messagePort.structuredClone),
 
 	// Branding as a WebIDL object
@@ -404,25 +405,6 @@ const DENIED_DENO_FS_API_LIST = ObjectKeys(fsVars)
 		{}
 	);
 
-const PATCH_DENO_API_LIST = {
-	...DENIED_DENO_FS_API_LIST,
-
-	'cwd': true,
-	'readFile': true,
-	'readFileSync': true,
-	'readTextFile': true,
-	'readTextFileSync': true,
-
-	'kill': MOCK_FN,
-	'exit': MOCK_FN,
-	'addSignalListener': MOCK_FN,
-	'removeSignalListener': MOCK_FN,
-
-	// TODO: use a non-hardcoded path
-	'execPath': () => '/bin/edge-runtime',
-	'memoryUsage': () => ops.op_runtime_memory_usage(),
-};
-
 globalThis.bootstrapSBEdge = (opts, extraCtx) => {
 	globalThis_ = globalThis;
 
@@ -538,10 +520,40 @@ globalThis.bootstrapSBEdge = (opts, extraCtx) => {
 			),
 		});
 
-		const apiNames = ObjectKeys(PATCH_DENO_API_LIST);
+		const apisToBeOverridden = {
+			...DENIED_DENO_FS_API_LIST,
+
+			'cwd': true,
+
+			'open': true,
+			'stat': true,
+			'realPath': true,
+			'create': true,
+			'remove': true,
+			'writeFile': true,
+			'writeTextFile': true,
+			'readFile': true,
+			'readTextFile': true,
+
+			'kill': MOCK_FN,
+			'exit': MOCK_FN,
+			'addSignalListener': MOCK_FN,
+			'removeSignalListener': MOCK_FN,
+
+			// TODO: use a non-hardcoded path
+			'execPath': () => '/bin/edge-runtime',
+			'memoryUsage': () => ops.op_runtime_memory_usage(),
+		};
+
+		if (extraCtx?.useReadSyncFileAPI) {
+			apisToBeOverridden['readFileSync'] = true;
+			apisToBeOverridden['readTextFileSync'] = true;
+		}
+
+		const apiNames = ObjectKeys(apisToBeOverridden);
 
 		for (const name of apiNames) {
-			const value = PATCH_DENO_API_LIST[name];
+			const value = apisToBeOverridden[name];
 
 			if (value === false) {
 				delete Deno[name];

@@ -131,6 +131,15 @@ fn get_start_command() -> Command {
                 .value_parser(value_parser!(u64).range(..u64::MAX)),
         )
         .arg(
+            arg!(--"event-worker-exit-timeout" [SECONDS])
+                .help(concat!(
+                    "Maximum time in seconds that can wait for the event worker before terminating ",
+                    "forcibly. (graceful exit)"
+                ))
+                .default_value("10")
+                .value_parser(value_parser!(u64).range(..u64::MAX))
+        )
+        .arg(
             arg!(
                 --"experimental-graceful-exit-keepalive-deadline-ratio"
                 <PERCENTAGE>
@@ -198,7 +207,11 @@ fn get_start_command() -> Command {
                 .requires("inspector")
                 .action(ArgAction::SetTrue),
         )
-        .arg(arg!(--"static" <Path>).help("Glob pattern for static files to be included"))
+        .arg(
+            arg!(--"static" <Path>)
+                .help("Glob pattern for static files to be included")
+                .action(ArgAction::Append)
+        )
         .arg(arg!(--"jsx-specifier" <Path> "A valid JSX specifier"))
         .arg(
             arg!(--"jsx-module" <Path> "A valid JSX module")
@@ -227,7 +240,11 @@ fn get_bundle_command() -> Command {
                 .help("Path to entrypoint to bundle as an eszip")
                 .required(true),
         )
-        .arg(arg!(--"static" <Path>).help("Glob pattern for static files to be included"))
+        .arg(
+            arg!(--"static" <Path>)
+                .help("Glob pattern for static files to be included")
+                .action(ArgAction::Append)
+        )
         .arg(arg!(--"import-map" <Path>).help("Path to import map file"))
         .arg(
             arg!(--"decorator" <TYPE>)
@@ -239,6 +256,12 @@ fn get_bundle_command() -> Command {
                 .env("EDGE_RUNTIME_BUNDLE_CHECKSUM")
                 .help("Hash function to use when checksum the contents")
                 .value_parser(value_parser!(EszipV2ChecksumKind))
+        )
+        .arg(
+            arg!(--"disable-module-cache")
+                .help("Disable using module cache")
+                .default_value("false")
+                .value_parser(FalseyValueParser::new())
         )
 }
 

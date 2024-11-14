@@ -13,10 +13,15 @@ use std::sync::Arc;
 use url::Url;
 use virtual_fs::VfsEntry;
 
-pub mod file_system;
+mod fs;
 mod rt;
-pub mod static_fs;
-pub mod virtual_fs;
+
+pub use fs::deno_compile_fs;
+pub use fs::prefix_fs;
+pub use fs::s3_fs;
+pub use fs::static_fs;
+pub use fs::tmp_fs;
+pub use fs::virtual_fs;
 
 pub struct VfsOpts {
     pub npm_resolver: Arc<dyn CliNpmResolver>,
@@ -136,7 +141,9 @@ where
                 // but also don't make this dependent on the registry url
                 let root_path = npm_resolver.global_cache_root_folder();
                 let mut builder = VfsBuilder::new(root_path, add_content_callback_fn)?;
-                for package in npm_resolver.all_system_packages(&NpmSystemInfo::default()) {
+                let mut packages = npm_resolver.all_system_packages(&NpmSystemInfo::default());
+                packages.sort_by(|a, b| a.id.cmp(&b.id)); // determinism
+                for package in packages {
                     let folder = npm_resolver.resolve_pkg_folder_from_pkg_id(&package.id)?;
                     builder.add_dir_recursive(&folder)?;
                 }

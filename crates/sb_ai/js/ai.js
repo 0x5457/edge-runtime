@@ -1,4 +1,4 @@
-
+import 'ext:sb_ai/js/onnxruntime/onnx.js';
 import EventSourceStream from 'ext:sb_ai/js/util/event_source_stream.mjs';
 
 const core = globalThis.Deno.core;
@@ -86,6 +86,7 @@ const parseJSONOverEventStream = async function* (itr, signal) {
 
 class Session {
     model;
+    init;
     is_ext_inference_api;
     inferenceAPIHost;
 
@@ -94,7 +95,7 @@ class Session {
         this.is_ext_inference_api = false;
 
         if (model === 'gte-small') {
-            core.ops.op_sb_ai_init_model(model);
+            this.init = core.ops.op_sb_ai_init_model(model);
         } else {
             this.inferenceAPIHost = core.ops.op_get_env('AI_INFERENCE_API_HOST');
             this.is_ext_inference_api = !!this.inferenceAPIHost; // only enable external inference API if env variable is set
@@ -183,7 +184,7 @@ class Session {
                             case 'openaicompatible': {
                                 const finishReason = message.choices[0].finish_reason;
 
-                                if (!!finishReason) {
+                                if (finishReason) {
                                     if (finishReason !== 'stop') {
                                         throw new Error('Expected a completed response.');
                                     }
@@ -226,6 +227,10 @@ class Session {
             }
         }
 
+        if (this.init) {
+            await this.init;
+        }
+
         const mean_pool = opts.mean_pool ?? true;
         const normalize = opts.normalize ?? true;
         const result = await core.ops.op_sb_ai_run_model(
@@ -239,4 +244,15 @@ class Session {
     }
 }
 
-export default { Session };
+const MAIN_WORKER_API = {
+    tryCleanupUnusedSession: () => core.ops.op_sb_ai_try_cleanup_unused_session(),
+};
+
+const USER_WORKER_API = {
+    Session,
+};
+
+export {
+    MAIN_WORKER_API,
+    USER_WORKER_API,
+};

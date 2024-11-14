@@ -1,3 +1,6 @@
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::async_yields_async)]
+
 #[path = "../src/utils/integration_test_helper.rs"]
 mod integration_test_helper;
 
@@ -11,7 +14,7 @@ use url::Url;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    io::{self, Cursor},
+    io::{self, BufRead, Cursor},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -23,10 +26,10 @@ use async_tungstenite::WebSocketStream;
 use base::{
     integration_test, integration_test_listen_fut, integration_test_with_server_flag,
     rt_worker::worker_ctx::{create_user_worker_pool, create_worker, TerminationToken},
-    server::{ServerEvent, ServerFlags, ServerHealth, Tls},
+    server::{Server, ServerEvent, ServerFlags, ServerHealth, Tls},
     DecoratorType,
 };
-use deno_core::serde_json;
+use deno_core::serde_json::{self, json};
 use futures_util::{future::BoxFuture, Future, FutureExt, SinkExt, StreamExt};
 use http::{Method, Request, Response as HttpResponse, StatusCode};
 use http_utils::utils::get_upgrade_type;
@@ -44,6 +47,7 @@ use sb_workers::context::{
 use serde::Deserialize;
 use serial_test::serial;
 use tokio::{
+    fs,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     join,
     net::TcpStream,
@@ -198,7 +202,6 @@ async fn test_not_trigger_pku_sigsegv_due_to_jit_compilation_non_cli() {
         no_module_cache: false,
         import_map_path: None,
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: None,
         maybe_entrypoint: None,
@@ -210,7 +213,10 @@ async fn test_not_trigger_pku_sigsegv_due_to_jit_compilation_non_cli() {
             event_worker_metric_src: None,
         }),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let ctx = create_worker((opts, main_termination_token.clone()), None, None)
@@ -357,7 +363,6 @@ async fn test_main_worker_boot_error() {
         no_module_cache: false,
         import_map_path: Some("./non-existing-import-map.json".to_string()),
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: None,
         maybe_entrypoint: None,
@@ -369,7 +374,10 @@ async fn test_main_worker_boot_error() {
             event_worker_metric_src: None,
         }),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let result = create_worker((opts, main_termination_token.clone()), None, None).await;
@@ -483,7 +491,6 @@ async fn test_main_worker_user_worker_mod_evaluate_exception() {
         no_module_cache: false,
         import_map_path: None,
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: None,
         maybe_entrypoint: None,
@@ -495,7 +502,10 @@ async fn test_main_worker_user_worker_mod_evaluate_exception() {
             event_worker_metric_src: None,
         }),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let ctx = create_worker((opts, main_termination_token.clone()), None, None)
@@ -866,7 +876,6 @@ async fn test_worker_boot_invalid_imports() {
         no_module_cache: false,
         import_map_path: None,
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: None,
         maybe_entrypoint: None,
@@ -874,7 +883,10 @@ async fn test_worker_boot_invalid_imports() {
         maybe_module_code: None,
         conf: WorkerRuntimeOpts::UserWorker(test_user_runtime_opts()),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let result = create_test_user_worker(opts).await;
@@ -894,7 +906,6 @@ async fn test_worker_boot_with_0_byte_eszip() {
         no_module_cache: false,
         import_map_path: None,
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: Some(EszipPayloadKind::VecKind(vec![])),
         maybe_entrypoint: Some("file:///src/index.ts".to_string()),
@@ -902,7 +913,10 @@ async fn test_worker_boot_with_0_byte_eszip() {
         maybe_module_code: None,
         conf: WorkerRuntimeOpts::UserWorker(test_user_runtime_opts()),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let result = create_test_user_worker(opts).await;
@@ -920,7 +934,6 @@ async fn test_worker_boot_with_invalid_entrypoint() {
         no_module_cache: false,
         import_map_path: None,
         env_vars: HashMap::new(),
-        events_rx: None,
         timing: None,
         maybe_eszip: None,
         maybe_entrypoint: Some("file:///meow/mmmmeeeow.ts".to_string()),
@@ -928,7 +941,10 @@ async fn test_worker_boot_with_invalid_entrypoint() {
         maybe_module_code: None,
         conf: WorkerRuntimeOpts::UserWorker(test_user_runtime_opts()),
         static_patterns: vec![],
+
         maybe_jsx_import_source_config: None,
+        maybe_s3_fs_config: None,
+        maybe_tmp_fs_config: None,
     };
 
     let result = create_test_user_worker(opts).await;
@@ -2449,7 +2465,6 @@ async fn test_should_be_able_to_bundle_against_various_exts() {
         async {
             generate_binary_eszip(
                 PathBuf::from(path),
-                #[allow(clippy::arc_with_non_send_sync)]
                 Arc::new(emitter_factory),
                 None,
                 None,
@@ -2536,6 +2551,531 @@ async fn test_should_be_able_to_bundle_against_various_exts() {
 
     test_serve_simple_fn("jsx", REACT_RESULT.as_bytes()).await;
     test_serve_simple_fn("tsx", REACT_RESULT.as_bytes()).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_private_npm_package_import() {
+    // Required because test_cases/main_with_registry/registry/registry-handler.ts:58
+    std::env::set_var("EDGE_RUNTIME_PORT", NON_SECURE_PORT.to_string());
+    let _guard = scopeguard::guard((), |_| {
+        std::env::remove_var("EDGE_RUNTIME_PORT");
+    });
+
+    let client = Client::new();
+    let run_server_fn = |main: &'static str, token| async move {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = tokio::task::spawn({
+            async move {
+                Server::new(
+                    "127.0.0.1",
+                    NON_SECURE_PORT,
+                    None,
+                    main.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Default::default(),
+                    Some(tx),
+                    Default::default(),
+                    Some(token),
+                    vec![],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .listen()
+                .await
+                .unwrap();
+            }
+        });
+
+        let _ev = loop {
+            match rx.recv().await {
+                Some(health) => break health.into_listening().unwrap(),
+                _ => continue,
+            }
+        };
+
+        handle
+    };
+
+    {
+        let token = TerminationToken::new();
+        let handle = run_server_fn("./test_cases/main_with_registry", token.clone()).await;
+
+        let resp = client
+            .request(
+                Method::GET,
+                format!(
+                    "http://localhost:{}/private-npm-package-import",
+                    NON_SECURE_PORT
+                ),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        let body = body.as_object().unwrap();
+
+        assert_eq!(body.len(), 2);
+        assert_eq!(body.get("meow"), Some(&json!("function")));
+        assert_eq!(body.get("odd"), Some(&json!(true)));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    {
+        let token = TerminationToken::new();
+        let handle = run_server_fn("./test_cases/main_with_registry", token.clone()).await;
+
+        let resp = client
+            .request(
+                Method::GET,
+                format!("http://localhost:{}/meow", NON_SECURE_PORT),
+            )
+            .header("x-service-path", "private-npm-package-import-2/inner")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        let body = body.as_object().unwrap();
+
+        assert_eq!(body.len(), 2);
+        assert_eq!(body.get("meow"), Some(&json!("function")));
+        assert_eq!(body.get("odd"), Some(&json!(true)));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    {
+        let token = TerminationToken::new();
+        let handle = run_server_fn("./test_cases/main_eszip", token.clone()).await;
+
+        let buf = {
+            let mut emitter_factory = EmitterFactory::new();
+
+            emitter_factory.set_npmrc_path("./test_cases/private-npm-package-import/.npmrc");
+
+            generate_binary_eszip(
+                PathBuf::from("./test_cases/private-npm-package-import/index.js"),
+                Arc::new(emitter_factory),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .into_bytes()
+        };
+
+        let resp = client
+            .request(
+                Method::POST,
+                format!("http://localhost:{}/meow", NON_SECURE_PORT),
+            )
+            .body(buf)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        let body = body.as_object().unwrap();
+
+        assert_eq!(body.len(), 2);
+        assert_eq!(body.get("meow"), Some(&json!("function")));
+        assert_eq!(body.get("odd"), Some(&json!(true)));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_tmp_fs_usage() {
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "use-tmp-fs",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let resp = resp.unwrap();
+
+                assert_eq!(resp.status().as_u16(), 200);
+
+                let body = resp.json::<serde_json::Value>().await.unwrap();
+                let body = body.as_object().unwrap();
+
+                assert_eq!(body.len(), 4);
+                assert_eq!(body.get("written"), Some(&json!(8)));
+                assert_eq!(body.get("content"), Some(&json!("meowmeow")));
+                assert_eq!(body.get("deleted"), Some(&json!(true)));
+
+                let steps = body.get("steps").unwrap().as_array().unwrap();
+
+                assert_eq!(&steps[0], &json!(true));
+                assert_eq!(&steps[1], &json!(false));
+            }),
+            TerminationToken::new()
+        );
+    }
+
+    {
+        integration_test!(
+            "./test_cases/main",
+            NON_SECURE_PORT,
+            "use-tmp-fs-2",
+            None,
+            None,
+            None,
+            None,
+            (|resp| async {
+                let resp = resp.unwrap();
+
+                assert_eq!(resp.status().as_u16(), 200);
+
+                let body = resp.json::<serde_json::Value>().await.unwrap();
+                let body = body.as_object().unwrap();
+
+                assert_eq!(body.len(), 2);
+                assert_eq!(body.get("hadExisted"), Some(&json!(true)));
+
+                let path = body.get("path").unwrap().as_str().unwrap();
+                let f = fs::read(path).await.unwrap();
+                let mut cursor = Cursor::new(&f);
+
+                let client = Client::new();
+                let resp2 = client
+                    .request(Method::GET, "https://httpbin.org/stream/20".to_string())
+                    .send()
+                    .await
+                    .unwrap();
+
+                assert_eq!(resp2.status().as_u16(), 200);
+
+                let body2 = resp2.bytes().await.unwrap();
+                let mut cursor2 = Cursor::new(&*body2);
+                let mut count = 0;
+
+                loop {
+                    use serde_json::*;
+
+                    let mut buf = String::new();
+
+                    cursor.read_line(&mut buf).unwrap();
+                    let mut msg = from_str::<Map<String, Value>>(&buf).unwrap();
+
+                    buf.clear();
+                    cursor2.read_line(&mut buf).unwrap();
+                    let mut msg2 = from_str::<Map<String, Value>>(&buf).unwrap();
+
+                    assert!(msg.remove("headers").is_some());
+                    assert!(msg2.remove("headers").is_some());
+                    assert_eq!(msg, msg2);
+
+                    count += 1;
+                    if count >= 20 {
+                        break;
+                    }
+                }
+            }),
+            TerminationToken::new()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_tmp_fs_should_not_be_available_in_import_stmt() {
+    // The s3 fs and tmp fs are not currently attached to the module loader, so the import statement
+    // should not recognize their prefixes. (But, depending on the case, they may be attached in the
+    // future)
+    integration_test!(
+        "./test_cases/main",
+        NON_SECURE_PORT,
+        "use-tmp-fs-in-import-stmt",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let (payload, status) = ErrorResponsePayload::assert_error_response(resp).await;
+
+            assert_eq!(status, 500);
+            dbg!(&payload.msg);
+            assert!(payload.msg.starts_with(
+                "InvalidWorkerResponse: event loop error while evaluating the module: \
+                TypeError: Module not found: file:///tmp/meowmeow.ts"
+            ));
+        }),
+        TerminationToken::new()
+    );
+}
+
+// -- sb_ai: ORT @huggingface/transformers
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_feature_extraction() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/feature-extraction",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_fill_mask() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/fill-mask",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_question_answering() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/question-answering",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_summarization() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/summarization",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_text_classification() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/text-classification",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_text_generation() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/text-generation",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_text2text_generation() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/text2text-generation",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_token_classification() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/token-classification",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_translation() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/translation",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_nlp_zero_shot_classification() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/zero-shot-classification",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_vision_image_feature_extraction() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/image-feature-extraction",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_vision_image_classification() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/image-classification",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ort_vision_zero_shot_image_classification() {
+    integration_test!(
+        "./test_cases/ai-ort-rust-backend/main",
+        NON_SECURE_PORT,
+        "transformers-js/zero-shot-image-classification",
+        None,
+        None,
+        None,
+        None,
+        (|resp| async {
+            let res = resp.unwrap();
+            assert_eq!(res.status().as_u16(), StatusCode::OK);
+        }),
+        TerminationToken::new()
+    );
 }
 
 #[derive(Deserialize)]

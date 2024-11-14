@@ -6,6 +6,8 @@ use event_worker::events::{UncaughtExceptionEvent, WorkerEventWithMetadata};
 use hyper_v014::{Body, Request, Response};
 use sb_core::util::sync::AtomicFlag;
 use sb_core::{MetricSource, SharedMetricSource};
+use sb_fs::s3_fs::S3FsConfig;
+use sb_fs::tmp_fs::TmpFsConfig;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::{collections::HashMap, sync::Arc};
@@ -66,18 +68,23 @@ pub struct UserWorkerRuntimeOpts {
     pub force_create: bool,
     pub net_access_disabled: bool,
     pub allow_net: Option<Vec<String>>,
-    pub custom_module_root: Option<String>,
     pub allow_remote_modules: bool,
+    pub custom_module_root: Option<String>,
+
+    pub context: Option<crate::JsonMap>,
 }
 
 impl Default for UserWorkerRuntimeOpts {
     fn default() -> UserWorkerRuntimeOpts {
         UserWorkerRuntimeOpts {
-            memory_limit_mb: 512,
-            worker_timeout_ms: 5 * 60 * 1000,
-            low_memory_multiplier: 5,
-            cpu_time_soft_limit_ms: 50,
-            cpu_time_hard_limit_ms: 100,
+            memory_limit_mb: env!("SUPABASE_RESOURCE_LIMIT_MEM_MB").parse().unwrap(),
+            low_memory_multiplier: env!("SUPABASE_RESOURCE_LIMIT_LOW_MEM_MULTIPLIER")
+                .parse()
+                .unwrap(),
+
+            worker_timeout_ms: env!("SUPABASE_RESOURCE_LIMIT_TIMEOUT_MS").parse().unwrap(),
+            cpu_time_soft_limit_ms: env!("SUPABASE_RESOURCE_LIMIT_CPU_SOFT_MS").parse().unwrap(),
+            cpu_time_hard_limit_ms: env!("SUPABASE_RESOURCE_LIMIT_CPU_HARD_MS").parse().unwrap(),
 
             force_create: false,
             key: None,
@@ -89,6 +96,8 @@ impl Default for UserWorkerRuntimeOpts {
             allow_remote_modules: true,
             custom_module_root: None,
             service_path: None,
+
+            context: None,
         }
     }
 }
@@ -114,10 +123,13 @@ pub struct MainWorkerRuntimeOpts {
     pub event_worker_metric_src: Option<MetricSource>,
 }
 
-#[derive(Debug, Clone)]
-pub struct EventWorkerRuntimeOpts {}
+#[derive(Debug)]
+pub struct EventWorkerRuntimeOpts {
+    pub events_msg_rx: Option<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>,
+    pub event_worker_exit_deadline_sec: Option<u64>,
+}
 
-#[derive(Debug, Clone, EnumAsInner)]
+#[derive(Debug, EnumAsInner)]
 pub enum WorkerRuntimeOpts {
     UserWorker(UserWorkerRuntimeOpts),
     MainWorker(MainWorkerRuntimeOpts),
@@ -184,21 +196,24 @@ impl Default for Timing {
     }
 }
 
+// TODO: Refactor this. Some members remove the `Default` trait bounds,
+// increasing complexity.
 #[derive(Debug)]
 pub struct WorkerContextInitOpts {
     pub service_path: PathBuf,
     pub no_module_cache: bool,
-    pub import_map_path: Option<String>,
     pub env_vars: HashMap<String, String>,
-    pub events_rx: Option<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>,
-    pub timing: Option<Timing>,
     pub conf: WorkerRuntimeOpts,
+    pub static_patterns: Vec<String>,
+    pub import_map_path: Option<String>,
+    pub timing: Option<Timing>,
     pub maybe_eszip: Option<EszipPayloadKind>,
     pub maybe_module_code: Option<FastString>,
     pub maybe_entrypoint: Option<String>,
     pub maybe_decorator: Option<DecoratorType>,
-    pub static_patterns: Vec<String>,
     pub maybe_jsx_import_source_config: Option<JsxImportSourceConfig>,
+    pub maybe_s3_fs_config: Option<S3FsConfig>,
+    pub maybe_tmp_fs_config: Option<TmpFsConfig>,
 }
 
 #[derive(Debug)]

@@ -9,7 +9,8 @@ use base::commands::start_server;
 
 use base::rt_worker::worker_pool::{SupervisorPolicy, WorkerPoolPolicy};
 use base::server::{ServerFlags, Tls, WorkerEntrypoints};
-use base::{DecoratorType, InspectorOption};
+use base::utils::path::find_up;
+use base::{CacheSetting, DecoratorType, InspectorOption};
 use clap::ArgMatches;
 use deno_core::url::Url;
 use env::resolve_deno_runtime_env;
@@ -22,9 +23,10 @@ use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<ExitCode, anyhow::Error> {
     resolve_deno_runtime_env();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -35,7 +37,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     // TODO: Tokio runtime shouldn't be needed here (Address later)
     let local = tokio::task::LocalSet::new();
-    let res: Result<(), Error> = local.block_on(&runtime, async {
+    let res: Result<ExitCode, Error> = local.block_on(&runtime, async {
         let matches = get_cli().get_matches();
         let verbose = matches.get_flag("verbose");
 
@@ -65,7 +67,7 @@ fn main() -> Result<(), anyhow::Error> {
 
         #[allow(clippy::single_match)]
         #[allow(clippy::arc_with_non_send_sync)]
-        match matches.subcommand() {
+        let exit_code = match matches.subcommand() {
             Some(("start", sub_matches)) => {
                 let ip = sub_matches.get_one::<String>("ip").cloned().unwrap();
                 let port = sub_matches.get_one::<u16>("port").copied().unwrap();
@@ -139,6 +141,11 @@ fn main() -> Result<(), anyhow::Error> {
                         }
                     });
 
+                let event_worker_exit_deadline_sec = sub_matches
+                    .get_one::<u64>("event-worker-exit-timeout")
+                    .cloned()
+                    .unwrap_or(0);
+
                 let maybe_max_parallelism =
                     sub_matches.get_one::<usize>("max-parallelism").cloned();
                 let maybe_request_wait_timeout =
@@ -180,12 +187,13 @@ fn main() -> Result<(), anyhow::Error> {
                     tcp_nodelay,
                     graceful_exit_deadline_sec,
                     graceful_exit_keepalive_deadline_ms,
+                    event_worker_exit_deadline_sec,
                     request_wait_timeout_ms: maybe_request_wait_timeout,
                     request_idle_timeout_ms: maybe_request_idle_timeout,
                     request_read_timeout_ms: maybe_request_read_timeout,
                 };
 
-                start_server(
+                let maybe_received_signum = start_server(
                     ip.as_str(),
                     port,
                     maybe_tls,
@@ -230,7 +238,12 @@ fn main() -> Result<(), anyhow::Error> {
                     jsx_module,
                 )
                 .await?;
+
+                maybe_received_signum
+                    .map(|it| ExitCode::from(it as u8))
+                    .unwrap_or_default()
             }
+
             Some(("bundle", sub_matches)) => {
                 let output_path = sub_matches.get_one::<String>("output").cloned().unwrap();
                 let import_map_path = sub_matches.get_one::<String>("import-map").cloned();
@@ -259,6 +272,7 @@ fn main() -> Result<(), anyhow::Error> {
                 let entrypoint_dir_path = entrypoint_script_path.parent().unwrap();
 
                 let mut emitter_factory = EmitterFactory::new();
+
                 let maybe_import_map = load_import_map(import_map_path.clone())
                     .map_err(|e| anyhow!("import map path is invalid ({})", e))?;
                 let mut maybe_import_map_url = None;
@@ -271,6 +285,22 @@ fn main() -> Result<(), anyhow::Error> {
                             .to_string(),
                     );
                 }
+
+                if sub_matches
+                    .get_one::<bool>("disable-module-cache")
+                    .cloned()
+                    .unwrap()
+                {
+                    emitter_factory.set_cache_strategy(CacheSetting::ReloadAll);
+                }
+
+                if let Some(npmrc_path) = find_up(".npmrc", entrypoint_dir_path) {
+                    if npmrc_path.exists() && npmrc_path.is_file() {
+                        emitter_factory.set_npmrc_path(npmrc_path);
+                        emitter_factory.set_npmrc_env_vars(std::env::vars().collect());
+                    }
+                }
+
                 let maybe_checksum_kind = sub_matches
                     .get_one::<EszipV2ChecksumKind>("checksum")
                     .copied()
@@ -302,7 +332,10 @@ fn main() -> Result<(), anyhow::Error> {
                     let mut file = File::create(output_path.as_str())?;
                     file.write_all(&bin)?
                 }
+
+                ExitCode::SUCCESS
             }
+
             Some(("unbundle", sub_matches)) => {
                 let output_path = sub_matches.get_one::<String>("output").cloned().unwrap();
                 let eszip_path = sub_matches.get_one::<String>("eszip").cloned().unwrap();
@@ -316,12 +349,17 @@ fn main() -> Result<(), anyhow::Error> {
                         output_path.to_str().unwrap()
                     );
                 }
+
+                ExitCode::SUCCESS
             }
+
             _ => {
                 // unrecognized command
+                ExitCode::FAILURE
             }
-        }
-        Ok(())
+        };
+
+        Ok(exit_code)
     });
 
     res

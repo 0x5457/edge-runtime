@@ -1,19 +1,22 @@
 use crate::inspector_server::Inspector;
 use crate::rt_worker::supervisor::{CPUUsage, CPUUsageMetrics};
 use crate::rt_worker::worker::DuplexStreamEntry;
+use crate::utils::json;
+use crate::utils::path::find_up;
 use crate::utils::units::{bytes_to_display, mib_to_bytes};
 
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{anyhow, bail, Error};
 use base_mem_check::{MemCheckState, WorkerHeapStatistics};
+use base_rt::DenoRuntimeDropToken;
+use base_rt::{get_current_cpu_time_ns, BlockingScopeCPUUsage};
 use cooked_waker::{IntoWaker, WakeRef};
-use cpu_timer::get_thread_time;
 use ctor::ctor;
 use deno_core::error::AnyError;
 use deno_core::url::Url;
 use deno_core::v8::{GCCallbackFlags, GCType, HeapStatistics, Isolate};
 use deno_core::{
     located_script_name, serde_json, JsRuntime, ModuleCodeString, ModuleId, ModuleLoader,
-    ModuleSpecifier, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
+    ModuleSpecifier, OpState, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
 };
 use deno_http::DefaultHttpPropertyExtractor;
 use deno_tls::deno_native_certs::load_native_certs;
@@ -21,20 +24,25 @@ use deno_tls::rustls::RootCertStore;
 use deno_tls::RootCertStoreProvider;
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
-use log::{error, trace};
+use log::error;
 use once_cell::sync::{Lazy, OnceCell};
-use sb_core::conn_sync::DenoRuntimeDropToken;
 use sb_core::http::sb_core_http;
 use sb_core::http_start::sb_core_http_start;
 use sb_core::util::sync::AtomicFlag;
+use sb_fs::prefix_fs::PrefixFs;
+use sb_fs::s3_fs::S3Fs;
 use sb_fs::static_fs::StaticFs;
+use sb_fs::tmp_fs::TmpFs;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::task::Poll;
@@ -43,7 +51,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::interval;
 use tokio_util::sync::{CancellationToken, PollSemaphore};
-use tracing::debug;
+use tracing::{debug, debug_span, instrument, trace, Instrument};
 
 use crate::snapshot;
 use event_worker::events::{EventMetadata, WorkerEventWithMetadata};
@@ -58,7 +66,7 @@ use sb_core::permissions::{sb_core_permissions, Permissions};
 use sb_core::runtime::sb_core_runtime;
 use sb_core::{sb_core_main_js, MemCheckWaker};
 use sb_env::sb_env as sb_env_op;
-use sb_fs::file_system::DenoCompileFileSystem;
+use sb_fs::deno_compile_fs::DenoCompileFileSystem;
 use sb_graph::emitter::EmitterFactory;
 use sb_graph::import_map::load_import_map;
 use sb_graph::{generate_binary_eszip, include_glob_patterns_in_eszip, EszipPayloadKind};
@@ -182,6 +190,7 @@ impl MemCheck {
             }
         }
 
+        trace!(malloced_mb = bytes_to_display(total_bytes as u64));
         total_bytes
     }
 }
@@ -197,10 +206,11 @@ impl GetRuntimeContext for () {
 }
 
 pub struct DenoRuntime<RuntimeContext = ()> {
+    pub js_runtime: ManuallyDrop<JsRuntime>,
     pub drop_token: CancellationToken,
-    pub js_runtime: JsRuntime,
     pub env_vars: HashMap<String, String>, // TODO: does this need to be pub?
     pub conf: WorkerRuntimeOpts,
+    pub s3_fs: Option<S3Fs>,
 
     pub(crate) termination_request_token: CancellationToken,
 
@@ -218,14 +228,18 @@ pub struct DenoRuntime<RuntimeContext = ()> {
 
 impl<RuntimeContext> Drop for DenoRuntime<RuntimeContext> {
     fn drop(&mut self) {
-        self.drop_token.cancel();
-
         if self.conf.is_user_worker() {
             self.js_runtime.v8_isolate().remove_gc_prologue_callback(
                 mem_check_gc_prologue_callback_fn,
                 Arc::as_ptr(&self.mem_check) as *mut _,
             );
         }
+
+        unsafe {
+            ManuallyDrop::drop(&mut self.js_runtime);
+        }
+
+        self.drop_token.cancel();
     }
 }
 
@@ -250,18 +264,19 @@ where
         maybe_inspector: Option<Inspector>,
     ) -> Result<Self, Error> {
         let WorkerContextInitOpts {
+            mut conf,
             service_path,
             no_module_cache,
             import_map_path,
             env_vars,
-            events_rx,
-            conf,
             maybe_eszip,
             maybe_entrypoint,
             maybe_decorator,
             maybe_module_code,
             static_patterns,
             maybe_jsx_import_source_config,
+            maybe_s3_fs_config,
+            maybe_tmp_fs_config,
             ..
         } = opts;
 
@@ -329,8 +344,15 @@ where
                 CacheSetting::Use
             };
 
+            if let Some(npmrc_path) = find_up(".npmrc", &base_dir_path) {
+                if npmrc_path.exists() && npmrc_path.is_file() {
+                    emitter_factory.set_npmrc_path(npmrc_path);
+                    emitter_factory.set_npmrc_env_vars(env_vars.clone());
+                }
+            }
+
             emitter_factory.set_file_fetcher_allow_remote(allow_remote_modules);
-            emitter_factory.set_file_fetcher_cache_strategy(cache_strategy);
+            emitter_factory.set_cache_strategy(cache_strategy);
             emitter_factory.set_decorator_type(maybe_decorator);
 
             if let Some(jsx_import_source_config) = maybe_jsx_import_source_config.clone() {
@@ -439,22 +461,33 @@ where
             vfs_path,
         } = rt_provider;
 
-        let op_fs = {
-            if is_user_worker {
-                Arc::new(StaticFs::new(
-                    static_files,
-                    base_dir_path,
-                    vfs_path,
-                    vfs,
-                    npm_snapshot,
-                )) as Arc<dyn deno_fs::FileSystem>
-            } else {
-                Arc::new(DenoCompileFileSystem::from_rc(vfs)) as Arc<dyn deno_fs::FileSystem>
-            }
-        };
+        let mut maybe_s3_fs = None;
+        let build_file_system_fn =
+            |base_fs: Arc<dyn deno_fs::FileSystem>| -> Result<Arc<dyn deno_fs::FileSystem>, AnyError> {
+                let tmp_fs = TmpFs::try_from(maybe_tmp_fs_config.unwrap_or_default())?;
+                let fs = PrefixFs::new("/tmp", tmp_fs, Some(base_fs));
+
+                Ok(if let Some(s3_fs) = maybe_s3_fs_config.map(S3Fs::new).transpose()? {
+                    maybe_s3_fs = Some(s3_fs.clone());
+                    Arc::new(fs.add_fs("/s3", s3_fs))
+                } else {
+                    Arc::new(fs)
+                })
+            };
+
+        let file_system = build_file_system_fn(if is_user_worker {
+            Arc::new(StaticFs::new(
+                static_files,
+                base_dir_path,
+                vfs_path,
+                vfs,
+                npm_snapshot,
+            ))
+        } else {
+            Arc::new(DenoCompileFileSystem::from_rc(vfs))
+        })?;
 
         let mod_code = module_code;
-
         let extensions = vec![
             sb_core_permissions::init_ops(net_access_disabled, allow_net),
             deno_webidl::deno_webidl::init_ops(),
@@ -486,7 +519,7 @@ where
             deno_tls::deno_tls::init_ops(),
             deno_http::deno_http::init_ops::<DefaultHttpPropertyExtractor>(),
             deno_io::deno_io::init_ops(stdio),
-            deno_fs::deno_fs::init_ops::<Permissions>(op_fs.clone()),
+            deno_fs::deno_fs::init_ops::<Permissions>(file_system.clone()),
             sb_env_op::init_ops(),
             sb_ai::init_ops(),
             sb_os::sb_os::init_ops(),
@@ -499,7 +532,11 @@ where
             sb_core_http_start::init_ops(),
             // NOTE(AndresP): Order is matters. Otherwise, it will lead to hard
             // errors such as SIGBUS depending on the platform.
-            deno_node::init_ops::<Permissions>(Some(node_resolver), Some(npm_resolver), op_fs),
+            deno_node::init_ops::<Permissions>(
+                Some(node_resolver),
+                Some(npm_resolver),
+                file_system,
+            ),
             sb_core_runtime::init_ops(Some(main_module_url.clone())),
         ];
 
@@ -537,7 +574,7 @@ where
             ..Default::default()
         };
 
-        let mut js_runtime = JsRuntime::new(runtime_options);
+        let mut js_runtime = ManuallyDrop::new(JsRuntime::new(runtime_options));
         let version: Option<&str> = option_env!("GIT_V_TAG");
 
         {
@@ -576,7 +613,20 @@ where
                     .copied()
                     .unwrap_or_default(),
             ]),
-            serde_json::json!(RuntimeContext::get_runtime_context())
+            {
+                let mut runtime_context = serde_json::json!(RuntimeContext::get_runtime_context());
+
+                json::merge_object(
+                    &mut runtime_context,
+                    &conf
+                        .as_user_worker()
+                        .and_then(|it| it.context.clone())
+                        .map(serde_json::Value::Object)
+                        .unwrap_or_else(|| serde_json::json!({})),
+                );
+
+                runtime_context
+            }
         );
 
         if let Some(inspector) = maybe_inspector.clone() {
@@ -611,10 +661,10 @@ where
 
             let mut env_vars = env_vars.clone();
 
-            if conf.is_events_worker() {
-                // if worker is an events worker, assert events_rx is to be available
-                op_state
-                    .put::<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>(events_rx.unwrap());
+            if let Some(opts) = conf.as_events_worker_mut() {
+                op_state.put::<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>(
+                    opts.events_msg_rx.take().unwrap(),
+                );
             }
 
             if conf.is_main_worker() || conf.is_user_worker() {
@@ -682,6 +732,7 @@ where
             js_runtime,
             env_vars,
             conf,
+            s3_fs: maybe_s3_fs,
 
             termination_request_token: CancellationToken::new(),
 
@@ -726,11 +777,12 @@ where
         let current_thread_id = std::thread::current().id();
         let mut accumulated_cpu_time_ns = 0i64;
 
-        let has_inspector = self.inspector().is_some();
+        let span = debug_span!("runtime", ?name, thread_id = ?current_thread_id);
+        let inspector = self.inspector();
         let mut mod_result_rx = unsafe {
             self.js_runtime.v8_isolate().enter();
 
-            if has_inspector {
+            if inspector.is_some() {
                 let is_terminated = self.is_terminated.clone();
                 let mut this = scopeguard::guard_on_unwind(&mut *self, |this| {
                     this.js_runtime.v8_isolate().exit();
@@ -763,11 +815,13 @@ where
 
             with_cpu_metrics_guard(
                 current_thread_id,
+                js_runtime.op_state(),
                 &maybe_cpu_usage_metrics_tx,
                 &mut accumulated_cpu_time_ns,
                 || js_runtime.mod_evaluate(self.main_module_id),
             )
-        };
+        }
+        .instrument(span.clone());
 
         macro_rules! get_accumulated_cpu_time_ms {
             () => {
@@ -776,12 +830,13 @@ where
         }
 
         {
-            let event_loop_fut = self.run_event_loop(
-                name.as_deref(),
-                current_thread_id,
-                &maybe_cpu_usage_metrics_tx,
-                &mut accumulated_cpu_time_ns,
-            );
+            let event_loop_fut = self
+                .run_event_loop(
+                    current_thread_id,
+                    &maybe_cpu_usage_metrics_tx,
+                    &mut accumulated_cpu_time_ns,
+                )
+                .instrument(span.clone());
 
             let mod_result = tokio::select! {
                 // Not using biased mode leads to non-determinism for relatively simple
@@ -810,11 +865,11 @@ where
 
         if let Err(err) = self
             .run_event_loop(
-                name.as_deref(),
                 current_thread_id,
                 &maybe_cpu_usage_metrics_tx,
                 &mut accumulated_cpu_time_ns,
             )
+            .instrument(span)
             .await
         {
             return (
@@ -828,7 +883,6 @@ where
 
     fn run_event_loop<'l>(
         &'l mut self,
-        name: Option<&'l str>,
         #[allow(unused_variables)] current_thread_id: ThreadId,
         maybe_cpu_usage_metrics_tx: &'l Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
         accumulated_cpu_time_ns: &'l mut i64,
@@ -869,6 +923,7 @@ where
             let js_runtime = &mut this.js_runtime;
             let cpu_metrics_guard = get_cpu_metrics_guard(
                 thread_id,
+                js_runtime.op_state(),
                 maybe_cpu_usage_metrics_tx,
                 accumulated_cpu_time_ns,
             );
@@ -912,17 +967,9 @@ where
 
             if is_user_worker {
                 let mem_state = mem_check_state.as_ref().unwrap();
-                let total_malloced_bytes = mem_state.check(js_runtime.v8_isolate().as_mut());
 
+                mem_state.check(js_runtime.v8_isolate().as_mut());
                 mem_state.waker.register(waker);
-
-                trace!(
-                    "name: {:?}, thread_id: {:?}, accumulated_cpu_time: {}ms, malloced: {}",
-                    name.as_ref(),
-                    thread_id,
-                    *accumulated_cpu_time_ns / 1_000_000,
-                    bytes_to_display(total_malloced_bytes as u64)
-                );
             }
 
             // NOTE(Nyannyacha): If tasks are empty or V8 is not evaluating the
@@ -975,8 +1022,11 @@ where
         }));
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn wait_for_inspector_session(&mut self) {
+        debug!(has_inspector = self.maybe_inspector.is_some());
         if let Some(inspector) = self.maybe_inspector.as_ref() {
+            debug!(addr = %inspector.server.host, server.inspector = ?inspector.option);
             let inspector_impl = self.js_runtime.inspector();
             let mut inspector_impl_ref = inspector_impl.borrow_mut();
 
@@ -1014,12 +1064,9 @@ pub fn import_meta_resolve_callback(
     loader.resolve(&specifier, &referrer, ResolutionKind::DynamicImport)
 }
 
-fn get_current_cpu_time_ns() -> Result<i64, Error> {
-    get_thread_time().context("can't get current thread time")
-}
-
 fn with_cpu_metrics_guard<'l, F, R>(
     thread_id: ThreadId,
+    op_state: Rc<RefCell<OpState>>,
     maybe_cpu_usage_metrics_tx: &'l Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
     accumulated_cpu_time_ns: &'l mut i64,
     work_fn: F,
@@ -1029,6 +1076,7 @@ where
 {
     let _cpu_metrics_guard = get_cpu_metrics_guard(
         thread_id,
+        op_state,
         maybe_cpu_usage_metrics_tx,
         accumulated_cpu_time_ns,
     );
@@ -1038,6 +1086,7 @@ where
 
 fn get_cpu_metrics_guard<'l>(
     thread_id: ThreadId,
+    op_state: Rc<RefCell<OpState>>,
     maybe_cpu_usage_metrics_tx: &'l Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
     accumulated_cpu_time_ns: &'l mut i64,
 ) -> scopeguard::ScopeGuard<(), impl FnOnce(()) + 'l> {
@@ -1055,14 +1104,23 @@ fn get_cpu_metrics_guard<'l>(
         debug_assert_eq!(thread_id, std::thread::current().id());
 
         let cpu_time_after_drop_ns = get_current_cpu_time_ns().unwrap_or(current_cpu_time_ns);
+        let blocking_cpu_time_ns =
+            BlockingScopeCPUUsage::get_cpu_usage_ns_and_reset(&mut op_state.borrow_mut());
+
         let diff_cpu_time_ns = cpu_time_after_drop_ns - current_cpu_time_ns;
 
         *accumulated_cpu_time_ns += diff_cpu_time_ns;
+        *accumulated_cpu_time_ns += blocking_cpu_time_ns;
 
         send_cpu_metrics_fn(CPUUsageMetrics::Leave(CPUUsage {
             accumulated: *accumulated_cpu_time_ns,
             diff: diff_cpu_time_ns,
         }));
+
+        debug!(
+            accumulated_cpu_time_ms = *accumulated_cpu_time_ns / 1_000_000,
+            blocking_cpu_time_ms = blocking_cpu_time_ns / 1_000_000,
+        );
     })
 }
 
@@ -1102,6 +1160,8 @@ mod test {
     use deno_config::JsxImportSourceConfig;
     use deno_core::error::AnyError;
     use deno_core::{serde_json, serde_v8, v8, FastString, ModuleCodeString, PollEventLoopOptions};
+    use sb_fs::s3_fs::S3FsConfig;
+    use sb_fs::tmp_fs::TmpFsConfig;
     use sb_graph::emitter::EmitterFactory;
     use sb_graph::{generate_binary_eszip, EszipPayloadKind};
     use sb_workers::context::{
@@ -1144,6 +1204,8 @@ mod test {
         worker_runtime_conf: Option<WorkerRuntimeOpts>,
         static_patterns: Vec<String>,
         jsx_import_source_config: Option<JsxImportSourceConfig>,
+        s3_fs_config: Option<S3FsConfig>,
+        tmp_fs_config: Option<TmpFsConfig>,
         _phantom_context: PhantomData<C>,
     }
 
@@ -1165,6 +1227,8 @@ mod test {
                 worker_runtime_conf: self.worker_runtime_conf,
                 static_patterns: self.static_patterns,
                 jsx_import_source_config: self.jsx_import_source_config,
+                s3_fs_config: self.s3_fs_config,
+                tmp_fs_config: self.tmp_fs_config,
                 _phantom_context: PhantomData,
             }
         }
@@ -1182,6 +1246,8 @@ mod test {
                 worker_runtime_conf,
                 static_patterns,
                 jsx_import_source_config,
+                s3_fs_config,
+                tmp_fs_config,
                 _phantom_context,
             } = self;
 
@@ -1216,10 +1282,11 @@ mod test {
                     static_patterns,
                     maybe_jsx_import_source_config: jsx_import_source_config,
 
-                    events_rx: None,
                     timing: None,
-
                     import_map_path: None,
+
+                    maybe_s3_fs_config: s3_fs_config,
+                    maybe_tmp_fs_config: tmp_fs_config,
                 },
                 None,
             )
@@ -1261,6 +1328,12 @@ mod test {
             self
         }
 
+        #[allow(unused)]
+        fn set_s3_fs_config(mut self, config: S3FsConfig) -> Self {
+            let _ = self.s3_fs_config.insert(config);
+            self
+        }
+
         fn set_jsx_import_source_config(mut self, config: JsxImportSourceConfig) -> Self {
             let _ = self.jsx_import_source_config.insert(config);
             self
@@ -1280,6 +1353,16 @@ mod test {
         }
     }
 
+    struct WithSyncFileAPI;
+
+    impl GetRuntimeContext for WithSyncFileAPI {
+        fn get_runtime_context() -> impl Serialize {
+            serde_json::json!({
+                "useReadSyncFileAPI": true,
+            })
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_module_code_no_eszip() {
@@ -1291,7 +1374,6 @@ mod test {
                 no_module_cache: false,
                 import_map_path: None,
                 env_vars: Default::default(),
-                events_rx: None,
                 timing: None,
                 maybe_eszip: None,
                 maybe_entrypoint: None,
@@ -1307,7 +1389,10 @@ mod test {
                     })
                 },
                 static_patterns: vec![],
+
                 maybe_jsx_import_source_config: None,
+                maybe_s3_fs_config: None,
+                maybe_tmp_fs_config: None,
             },
             None,
         )
@@ -1338,7 +1423,6 @@ mod test {
                 no_module_cache: false,
                 import_map_path: None,
                 env_vars: Default::default(),
-                events_rx: None,
                 timing: None,
                 maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
                 maybe_entrypoint: None,
@@ -1352,7 +1436,10 @@ mod test {
                     })
                 },
                 static_patterns: vec![],
+
                 maybe_jsx_import_source_config: None,
+                maybe_s3_fs_config: None,
+                maybe_tmp_fs_config: None,
             },
             None,
         )
@@ -1402,7 +1489,6 @@ mod test {
                 no_module_cache: false,
                 import_map_path: None,
                 env_vars: Default::default(),
-                events_rx: None,
                 timing: None,
                 maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
                 maybe_entrypoint: None,
@@ -1416,7 +1502,10 @@ mod test {
                     })
                 },
                 static_patterns: vec![],
+
                 maybe_jsx_import_source_config: None,
+                maybe_s3_fs_config: None,
+                maybe_tmp_fs_config: None,
             },
             None,
         )
@@ -1492,7 +1581,11 @@ mod test {
     #[tokio::test]
     #[serial]
     async fn test_main_rt_fs() {
-        let mut main_rt = RuntimeBuilder::new().set_std_env().build().await;
+        let mut main_rt = RuntimeBuilder::new()
+            .set_std_env()
+            .set_context::<WithSyncFileAPI>()
+            .build()
+            .await;
 
         let global_value_deno_read_file_script = main_rt
             .js_runtime
@@ -1588,6 +1681,7 @@ mod test {
         let mut user_rt = RuntimeBuilder::new()
             .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Default::default()))
             .add_static_pattern("./test_cases/**/*.md")
+            .set_context::<WithSyncFileAPI>()
             .build()
             .await;
 
@@ -1884,6 +1978,7 @@ mod test {
             worker_timeout_ms,
             static_patterns,
         )
+        .set_context::<WithSyncFileAPI>()
         .build()
         .await;
 
@@ -1982,6 +2077,7 @@ mod test {
         impl GetRuntimeContext for Ctx {
             fn get_runtime_context() -> impl Serialize {
                 serde_json::json!({
+                    "useReadSyncFileAPI": true,
                     "shouldBootstrapMockFnThrowError": true,
                 })
             }

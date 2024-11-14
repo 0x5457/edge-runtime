@@ -359,6 +359,8 @@ impl WorkerPool {
                         maybe_entrypoint,
                         maybe_decorator,
                         maybe_jsx_import_source_config,
+                        maybe_s3_fs_config,
+                        maybe_tmp_fs_config,
                         ..
                     } = worker_options;
 
@@ -369,7 +371,6 @@ impl WorkerPool {
                                 no_module_cache,
                                 import_map_path,
                                 env_vars,
-                                events_rx: None,
                                 timing: None,
                                 conf,
                                 maybe_eszip,
@@ -377,7 +378,10 @@ impl WorkerPool {
                                 maybe_entrypoint,
                                 maybe_decorator,
                                 static_patterns: vec![],
+
                                 maybe_jsx_import_source_config,
+                                maybe_s3_fs_config,
+                                maybe_tmp_fs_config,
                             },
                             tx,
                         ))
