@@ -488,6 +488,7 @@ impl WorkerPool {
             status: status.clone(),
             exit: surface.exit,
             cancel,
+            abort_handle: surface.abort_handle,
           };
 
           if worker_pool_msgs_tx
@@ -658,11 +659,20 @@ impl WorkerPool {
   pub fn shutdown(&mut self, key: &Uuid) {
     self.retire(key);
 
-    let Some((notify_tx, _)) = self
-      .user_workers
-      .remove(key)
-      .and_then(|it| self.active_workers.get(&it.service_path))
-      .map(|it| it.notify_pair.clone())
+    let Some(profile) = self.user_workers.remove(key) else {
+      return;
+    };
+
+    // abort worker background task, ensure DenoRuntime is released correctly
+    if let Some(abort_handle) = profile.abort_handle.as_ref() {
+      abort_handle.abort();
+      log::debug!("Worker {} background task aborted for cleanup", key);
+    }
+
+    let Some(notify_tx) = self
+      .active_workers
+      .get(&profile.service_path)
+      .map(|it| it.notify_pair.0.clone())
     else {
       return;
     };

@@ -212,7 +212,7 @@ impl Worker {
       Result<(MetricSource, CancellationToken), Error>,
     >,
     exit: WorkerExit,
-  ) {
+  ) -> Option<Arc<tokio::task::AbortHandle>> {
     let worker_name = self.worker_name.clone();
     let worker_key = self.worker_key;
     let event_metadata = self.event_metadata.clone();
@@ -371,9 +371,20 @@ impl Worker {
       metadata = ?event_metadata
     ));
 
-    drop(tokio::spawn(unsafe {
+    // save JoinHandle to ensure worker task can be completed and memory released correctly
+    let join_handle = tokio::spawn(unsafe {
       MaskFutureAsSend::new(worker_result_fut)
-    }));
+    });
+
+    // return AbortHandle to wait for task completion when shutting down
+    let abort_handle = worker_kind.is_user_worker().then(|| Arc::new(join_handle.abort_handle()));
+
+    // for non-user worker, keep original behavior
+    if !worker_kind.is_user_worker() {
+      drop(join_handle);
+    }
+
+    abort_handle
   }
 }
 
@@ -383,4 +394,5 @@ pub struct WorkerSurface {
   pub msg_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
   pub exit: WorkerExit,
   pub cancel: CancellationToken,
+  pub abort_handle: Option<Arc<tokio::task::AbortHandle>>,
 }

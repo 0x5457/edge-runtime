@@ -149,6 +149,7 @@ pub struct UserWorkerProfile {
   pub cancel: CancellationToken,
   pub status: TimingStatus,
   pub exit: WorkerExit,
+  pub abort_handle: Option<Arc<tokio::task::AbortHandle>>,
 }
 
 #[derive(Debug, Clone)]

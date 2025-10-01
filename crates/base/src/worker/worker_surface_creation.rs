@@ -410,7 +410,7 @@ impl WorkerSurfaceBuilder {
     let cx = worker.cx.clone();
     let network_sender = worker.imp.network_sender().await;
 
-    worker.start(eager_module_init, worker_boot_result_tx, exit.clone());
+    let abort_handle = worker.start(eager_module_init, worker_boot_result_tx, exit.clone());
 
     // create an async task waiting for requests for worker
     let (worker_req_tx, mut worker_req_rx) =
@@ -453,6 +453,7 @@ impl WorkerSurfaceBuilder {
           msg_tx: worker_req_tx,
           exit,
           cancel,
+          abort_handle,
         })
       }
 
