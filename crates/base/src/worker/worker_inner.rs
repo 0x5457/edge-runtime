@@ -1,5 +1,6 @@
 use std::future::ready;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::Error;
 use base_rt::error::CloneableError;
@@ -319,16 +320,33 @@ impl Worker {
       }
       .instrument(span);
 
-      Some(
-        rt.spawn_pinned({
+      static NEVER_CANCELLED: OnceLock<CancellationToken> = OnceLock::new();
+      let cancel_fut = cx
+        .cancel
+        .as_ref()
+        .map(|c| c.cancelled())
+        .unwrap_or_else(|| {
+          NEVER_CANCELLED
+            .get_or_init(|| CancellationToken::new())
+            .cancelled()
+        });
+
+      Some(tokio::select! {
+        _ = cancel_fut => {
+          log::warn!("Worker {:?} cancelled while waiting for spawn_pinned", worker_key);
+          return None;
+        }
+
+        result = rt.spawn_pinned({
           let fut = unsafe { MaskFutureAsSend::new(worker_poll_fut) };
           move || tokio::task::spawn_local(fut)
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|it| it.map_err(anyhow::Error::from))
-        .and_then(|it| it.into_inner()),
-      )
+        }) => {
+          result
+            .map_err(anyhow::Error::from)
+            .and_then(|it| it.map_err(anyhow::Error::from))
+            .and_then(|it| it.into_inner())
+        }
+      })
     };
     let worker_result_fut = {
       let event_metadata = event_metadata.clone();

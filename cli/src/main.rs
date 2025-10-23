@@ -1,3 +1,13 @@
+// Configure jemalloc as the global allocator
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Enable jemalloc profiling
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] =
+  b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
 use std::fs::File;
 use std::io::Write;
 use std::net::IpAddr;
@@ -45,6 +55,10 @@ mod logger;
 
 fn main() -> Result<ExitCode, anyhow::Error> {
   resolve_deno_runtime_env();
+
+  // Setup USR1 signal handler for memory profiling
+  #[cfg(unix)]
+  setup_signal_handlers();
 
   let runtime = tokio::runtime::Builder::new_current_thread()
     .enable_all()
@@ -464,4 +478,72 @@ fn get_inspector_option(
     "inspect-wait" => Ok(InspectorOption::WithWait(*addr)),
     key => bail!("invalid inspector key: {}", key),
   }
+}
+
+#[cfg(unix)]
+fn setup_signal_handlers() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
+  static SIGNAL_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+  if SIGNAL_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+    return; // Already installed
+  }
+
+  // Setup USR1 signal handler for memory dump
+  unsafe {
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = handle_usr1_signal as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    libc::sigemptyset(&mut sa.sa_mask);
+    libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+  }
+
+  log::info!("USR1 signal handler installed for memory profiling");
+}
+
+#[cfg(unix)]
+extern "C" fn handle_usr1_signal(
+  _signum: libc::c_int,
+  _info: *mut libc::siginfo_t,
+  _context: *mut libc::c_void,
+) {
+  // Signal handlers should be async-signal-safe, so we spawn a thread to do the work
+  std::thread::spawn(|| {
+    if let Err(e) = dump_memory_profile() {
+      eprintln!("Failed to dump memory profile: {}", e);
+    }
+  });
+}
+
+#[cfg(unix)]
+fn dump_memory_profile() -> Result<(), Box<dyn std::error::Error>> {
+  use std::time::SystemTime;
+
+  // Get current timestamp for filename
+  let timestamp = SystemTime::now()
+    .duration_since(SystemTime::UNIX_EPOCH)?
+    .as_secs();
+
+  let filename = format!("heap_profile_{}.pb.gz", timestamp);
+
+  // Dump the profile using jemalloc_pprof
+  let prof_ctl = jemalloc_pprof::PROF_CTL
+    .as_ref()
+    .ok_or("jemalloc profiling not enabled")?;
+
+  let mut prof_ctl = futures::executor::block_on(prof_ctl.lock());
+
+  if !prof_ctl.activated() {
+    return Err("heap profiling not activated".into());
+  }
+
+  let pprof_data = prof_ctl.dump_pprof()?;
+
+  // Write to file
+  std::fs::write(&filename, pprof_data)?;
+
+  log::info!("Memory profile dumped to: {}", filename);
+
+  Ok(())
 }
